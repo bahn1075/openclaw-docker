@@ -3,14 +3,10 @@ set -euo pipefail
 
 # Cron-safe launcher for the OpenClaw Docker gateway image updater.
 #
-# Default mode must NEVER run the Docker Compose replacement in the foreground.
-# The updater recreates the gateway container; if a gateway cron run is still
-# attached to that container, the cron agent can be killed midway and leave the
-# service down or only partially replaced.
-#
-# Safe flow:
-#   normal cron invocation -> dispatch detached host process -> exit quickly
-#   detached host process  -> re-enter this script with --host-run -> update
+# Do not run scripts/update-openclaw-gateway-image directly from the gateway
+# cron. That script recreates the gateway container, so a foreground cron run
+# inside the same container can be killed midway and leave Docker Compose in a
+# partially replaced state.
 
 APP_DIR="${OPENCLAW_GATEWAY_APP_DIR:-/app/openclaw-docker}"
 ENV_FILE="${APP_DIR}/.env"
@@ -34,11 +30,6 @@ require_cmd() {
     log "missing required command: $1"
     exit 127
   }
-}
-
-shell_quote() {
-  # POSIX-safe single-quote escaping for embedding paths in bash -c.
-  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\''/g")"
 }
 
 env_value() {
@@ -77,30 +68,13 @@ latest_stable_tag() {
   jq -Rr 'select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))' "${tmpdir}/tags" | sort -V | tail -n 1
 }
 
-detached_command() {
-  local q_log_dir q_log_file q_app_dir q_script
-  q_log_dir="$(shell_quote "$LOG_DIR")"
-  q_log_file="$(shell_quote "$LOG_FILE")"
-  q_app_dir="$(shell_quote "$APP_DIR")"
-  q_script="$(shell_quote "$SCRIPT_ON_HOST")"
+dispatch_from_gateway() {
+  require_cmd "$BASTION_RUN"
 
-  cat <<CMD
-mkdir -p ${q_log_dir}
-nohup env OPENCLAW_GATEWAY_SELF_UPDATE_HOST_MODE=1 OPENCLAW_GATEWAY_APP_DIR=${q_app_dir} ${q_script} --host-run >>${q_log_file} 2>&1 </dev/null &
-CMD
-}
-
-dispatch_detached() {
-  local cmd
-  cmd="$(detached_command)"
-
-  if [ -d /host/app/openclaw-docker ] && command -v "$BASTION_RUN" >/dev/null 2>&1; then
-    # Running inside the gateway container: cross into the host, then detach.
-    "$BASTION_RUN" bash -c "$cmd"
-  else
-    # Running directly on the host, e.g. via: bastion-run /app/.../update-openclaw-gateway-image
-    bash -c "$cmd"
-  fi
+  "$BASTION_RUN" bash -c "
+    mkdir -p '${LOG_DIR}'
+    nohup env OPENCLAW_GATEWAY_SELF_UPDATE_HOST_MODE=1 OPENCLAW_GATEWAY_APP_DIR='${APP_DIR}' '${SCRIPT_ON_HOST}' --host-run >>'${LOG_FILE}' 2>&1 </dev/null &
+  "
 
   log "dispatched detached gateway update on bastion host"
   log "host log: ${LOG_FILE}"
@@ -153,10 +127,12 @@ main() {
       run_on_host "$@"
       ;;
     *)
-      if [ "${OPENCLAW_GATEWAY_SELF_UPDATE_HOST_MODE:-0}" = "1" ]; then
-        run_on_host "$@"
+      if [ "${OPENCLAW_GATEWAY_SELF_UPDATE_HOST_MODE:-0}" != "1" ] \
+        && [ -d /host/app/openclaw-docker ] \
+        && command -v "$BASTION_RUN" >/dev/null 2>&1; then
+        dispatch_from_gateway
       else
-        dispatch_detached
+        run_on_host "$@"
       fi
       ;;
   esac
